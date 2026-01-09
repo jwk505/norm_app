@@ -38,14 +38,20 @@ def exec_sql(sql: str, params: Tuple = ()) -> int:
     finally:
         conn.close()
 
-def exec_many(sql: str, rows: List[Tuple]) -> int:
+def exec_many(sql: str, rows: List[Tuple], batch_size: int = 1000) -> int:
     if not rows:
         return 0
+    if batch_size <= 0:
+        batch_size = len(rows)
     conn = get_conn()
     try:
         cur = conn.cursor()
-        cur.executemany(sql, rows)
-        conn.commit()
-        return len(rows)
+        total = 0
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i : i + batch_size]
+            cur.executemany(sql, batch)
+            conn.commit()
+            total += len(batch)
+        return total
     finally:
         conn.close()

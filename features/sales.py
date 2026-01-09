@@ -1,5 +1,6 @@
 # pages/sales.py
 from typing import List, Optional, Tuple
+import re
 
 import pandas as pd
 import streamlit as st
@@ -21,18 +22,44 @@ def _table_exists(table_name: str) -> bool:
     return (not df.empty) and int(df.iloc[0]["c"]) > 0
 
 
-def _find_header_row(df_no_header: pd.DataFrame, needle: str = "년도", max_scan: int = 40) -> Optional[int]:
+def _norm_key(val: str) -> str:
+    return re.sub(r"[\s_]+", "", str(val)).strip().lower()
+
+
+def _find_header_row(
+    df_no_header: pd.DataFrame, tokens: Optional[List[str]] = None, max_scan: int = 40
+) -> Optional[int]:
+    tokens = tokens or ["년도", "연도", "연월", "년", "year", "yr"]
+    token_keys = [_norm_key(t) for t in tokens]
+
     n = min(max_scan, len(df_no_header))
     for i in range(n):
         row_vals = df_no_header.iloc[i].astype(str).tolist()
-        if any(needle in v for v in row_vals):
-            return i
+        for v in row_vals:
+            vk = _norm_key(v)
+            if any(tk and tk in vk for tk in token_keys):
+                return i
+    return None
+
+
+def _find_col_by_tokens(columns, tokens: List[str]) -> Optional[str]:
+    cols = list(columns)
+    col_map = {_norm_key(c): c for c in cols}
+    token_keys = [_norm_key(t) for t in tokens]
+
+    for tk in token_keys:
+        if tk in col_map:
+            return col_map[tk]
+    for c in cols:
+        ck = _norm_key(c)
+        if any(tk and tk in ck for tk in token_keys):
+            return c
     return None
 
 
 def _read_one_sheet_any_header(excel_source, sheet_name) -> pd.DataFrame:
     raw = pd.read_excel(excel_source, sheet_name=sheet_name, header=None, engine="openpyxl")
-    header_row = _find_header_row(raw, needle="년도", max_scan=40)
+    header_row = _find_header_row(raw, max_scan=40)
 
     if header_row is None:
         df = raw.copy()
@@ -55,13 +82,16 @@ def load_sales_all_sheets(upload_or_path) -> pd.DataFrame:
 def parse_year(val) -> Optional[int]:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
-    s = str(val).strip().replace("년", "").strip()
-    try:
-        y = int(float(s))
+    if isinstance(val, (int, float)) and not pd.isna(val):
+        y = int(val)
         if 2000 <= y <= 2100:
             return y
-    except Exception:
-        return None
+    s = str(val).strip()
+    m = re.search(r"(20\d{2}|21\d{2})", s)
+    if m:
+        y = int(m.group(1))
+        if 2000 <= y <= 2100:
+            return y
     return None
 
 
@@ -81,36 +111,33 @@ def is_sheet_2425(sheet_name: str) -> bool:
 
 
 def detect_year_col(df: pd.DataFrame) -> Optional[str]:
-    if "년도" in df.columns:
-        return "년도"
-    if "연도" in df.columns:
-        return "연도"
-    return None
+    tokens = ["년도", "연도", "연월", "년", "year", "yr"]
+    return _find_col_by_tokens(df.columns, tokens)
 
 
 def detect_amount_col(df: pd.DataFrame) -> Optional[str]:
-    for c in ["공급가액", "매출액", "매출", "금액", "공급가", "매출금액"]:
-        if c in df.columns:
-            return c
-    return None
+    tokens = ["매출금액", "매출액", "공급가액", "금액", "매출", "amount", "sales", "amt"]
+    return _find_col_by_tokens(df.columns, tokens)
 
 
 def pick_customer_col_for_sheet(df: pd.DataFrame, sheet: str) -> Optional[str]:
     if is_sheet_2425(sheet):
-        if "사용상호" in df.columns:
-            return "사용상호"
-        if "거래처명" in df.columns:
-            return "거래처명"
-        if "거래처" in df.columns:
-            return "거래처"
+        for candidates in [
+            ["사업자등록번호", "사업자번호", "사업자등록", "사업자", "businessno", "bizno", "biz_no"],
+            ["사용상호", "거래처명", "거래처", "업체명", "상호", "customer", "client", "account", "buyer"],
+        ]:
+            col = _find_col_by_tokens(df.columns, candidates)
+            if col:
+                return col
         return None
 
-    if "거래처명" in df.columns:
-        return "거래처명"
-    if "거래처" in df.columns:
-        return "거래처"
-    if "사용상호" in df.columns:
-        return "사용상호"
+    for candidates in [
+        ["거래처명", "거래처", "업체명", "상호", "사용상호", "customer", "client", "account", "buyer"],
+        ["사업자등록번호", "사업자번호", "사업자", "businessno", "bizno", "biz_no"],
+    ]:
+        col = _find_col_by_tokens(df.columns, candidates)
+        if col:
+            return col
     return None
 
 
