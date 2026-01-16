@@ -12,7 +12,7 @@ def fmt_int(v) -> str:
     except Exception:
         return "0"
 
-def render_table(df: pd.DataFrame, number_cols=None, hide_index=True, key=None):
+def render_table(df: pd.DataFrame, number_cols=None, hide_index=True, key=None, total_label: str | None = None):
     """
     ✅ 표 안 숫자 3자리 콤마 '확실히' 표시 (Pandas Styler)
     - 데이터는 숫자 유지
@@ -31,6 +31,14 @@ def render_table(df: pd.DataFrame, number_cols=None, hide_index=True, key=None):
 
     fmt = {c: "{:,.0f}" for c in number_cols if c in view.columns}
     sty = view.style.format(fmt, na_rep="")
+
+    if total_label and len(view.columns) > 0:
+        first_col = view.columns[0]
+        def _highlight_total(row):
+            if str(row.get(first_col, "")) == total_label:
+                return ["font-weight: 700; background-color: #f0f2f6"] * len(row)
+            return [""] * len(row)
+        sty = sty.apply(_highlight_total, axis=1)
 
     if number_cols:
         sty = sty.set_properties(subset=[c for c in number_cols if c in view.columns], **{"text-align": "right"})

@@ -14,9 +14,21 @@ from features.sales import (
     detect_amount_col,
     detect_year_col,
     detect_corp_col,
+    detect_channel_col,
+    detect_item_code_col,
+    detect_item_name_col,
+    detect_maker_col,
+    detect_unit_price_col,
     find_sales_raw_corp_col,
+    find_sales_raw_channel_col,
     find_sales_raw_customer_cols,
+    pick_sales_raw_item_code_col,
+    pick_sales_raw_item_name_col,
+    pick_sales_raw_maker_col,
+    pick_sales_raw_channel_col,
+    pick_sales_raw_unit_price_col,
     compute_row_hash,
+    ensure_sales_raw_optional_columns,
     normalize_str_series,
     parse_year,
     pick_customer_col_for_sheet,
@@ -115,6 +127,11 @@ def _show_sales_upload():
             raw = load_sales_all_sheets(up)
             year_col = detect_year_col(raw)
             amount_col = detect_amount_col(raw)
+            channel_col = detect_channel_col(raw)
+            item_code_col = detect_item_code_col(raw)
+            item_name_col = detect_item_name_col(raw)
+            maker_col = detect_maker_col(raw)
+            unit_price_col = detect_unit_price_col(raw)
             if not year_col:
                 st.error("Could not find a year column in the Excel file.")
                 return
@@ -128,10 +145,17 @@ def _show_sales_upload():
             df["customer_col"] = ""
             df["customer_raw"] = pd.NA
             df["corp"] = pd.NA
+            df["channel"] = pd.NA
+            df["item_code"] = df[item_code_col] if item_code_col else pd.NA
+            df["item_name"] = df[item_name_col] if item_name_col else pd.NA
+            df["maker"] = df[maker_col] if maker_col else pd.NA
+            df["unit_price"] = df[unit_price_col] if unit_price_col else pd.NA
 
             corp_col = detect_corp_col(raw)
             if corp_col and corp_col in df.columns:
                 df["corp"] = df[corp_col]
+            if channel_col and channel_col in df.columns:
+                df["channel"] = df[channel_col]
 
             sheet_to_cust = {}
             for sheet in df["_sheet"].astype(str).unique().tolist():
@@ -146,6 +170,11 @@ def _show_sales_upload():
 
             df["customer_raw"] = normalize_str_series(df["customer_raw"])
             df["corp"] = normalize_str_series(df["corp"])
+            df["channel"] = normalize_str_series(df["channel"])
+            df["item_code"] = normalize_str_series(df["item_code"])
+            df["item_name"] = normalize_str_series(df["item_name"])
+            df["maker"] = normalize_str_series(df["maker"])
+            df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce")
             df = df[df["year"].notna() & df["amount"].notna() & df["customer_raw"].notna()]
             df["year"] = df["year"].astype(int)
 
@@ -160,8 +189,32 @@ def _show_sales_upload():
             status.write("기존 데이터 삭제: 건너뜀")
 
         sales_cols = get_columns("sales_raw")
+        item_code_db_col = pick_sales_raw_item_code_col(sales_cols)
+        item_name_db_col = pick_sales_raw_item_name_col(sales_cols)
+        maker_db_col = pick_sales_raw_maker_col(sales_cols)
+        unit_price_db_col = pick_sales_raw_unit_price_col(sales_cols)
+        channel_db_col = pick_sales_raw_channel_col(sales_cols)
+        to_add = {}
+        if item_code_col and not item_code_db_col:
+            to_add["item_code"] = "VARCHAR(64)"
+        if item_name_col and not item_name_db_col:
+            to_add["item_name"] = "VARCHAR(255)"
+        if maker_col and not maker_db_col:
+            to_add["maker"] = "VARCHAR(64)"
+        if unit_price_col and not unit_price_db_col:
+            to_add["unit_price"] = "DECIMAL(14,2)"
+        if channel_col and not channel_db_col:
+            to_add["channel"] = "VARCHAR(64)"
+        if to_add:
+            sales_cols = ensure_sales_raw_optional_columns(to_add)
+            item_code_db_col = pick_sales_raw_item_code_col(sales_cols)
+            item_name_db_col = pick_sales_raw_item_name_col(sales_cols)
+            maker_db_col = pick_sales_raw_maker_col(sales_cols)
+            unit_price_db_col = pick_sales_raw_unit_price_col(sales_cols)
+            channel_db_col = pick_sales_raw_channel_col(sales_cols)
         use_row_hash = "row_hash" in sales_cols
         corp_db_col = find_sales_raw_corp_col(sales_cols)
+        channel_db_col = channel_db_col or find_sales_raw_channel_col(sales_cols)
         customer_cols = find_sales_raw_customer_cols(sales_cols)
         if not customer_cols:
             status.update(label="고객 컬럼 없음", state="error", expanded=True)
@@ -169,7 +222,11 @@ def _show_sales_upload():
             return
         customer_alias_col = "customer_raw" if "customer_raw" in sales_cols else customer_cols[0]
         if corp_col and not corp_db_col:
-            status.write("주의: sales_raw에 구분 컬럼이 없어 엑셀 구분 값을 저장하지 못합니다.")
+            sales_cols = ensure_sales_raw_optional_columns({"corp": "VARCHAR(64)"})
+            corp_db_col = find_sales_raw_corp_col(sales_cols)
+        if channel_col and not channel_db_col:
+            sales_cols = ensure_sales_raw_optional_columns({"channel": "VARCHAR(64)"})
+            channel_db_col = find_sales_raw_channel_col(sales_cols)
 
         insert_cols = []
         if use_row_hash:
@@ -179,12 +236,32 @@ def _show_sales_upload():
         insert_cols += ["amount", "customer_col"]
         if corp_db_col:
             insert_cols.append(corp_db_col)
+        if item_code_db_col:
+            insert_cols.append(item_code_db_col)
+        if item_name_db_col:
+            insert_cols.append(item_name_db_col)
+        if maker_db_col:
+            insert_cols.append(maker_db_col)
+        if unit_price_db_col:
+            insert_cols.append(unit_price_db_col)
+        if channel_db_col:
+            insert_cols.append(channel_db_col)
 
         update_sql = ""
         if use_row_hash:
             update_sql = " ON DUPLICATE KEY UPDATE row_hash = row_hash"
             if corp_db_col:
                 update_sql = update_sql + f", {corp_db_col}=VALUES({corp_db_col})"
+            if item_code_db_col:
+                update_sql = update_sql + f", {item_code_db_col}=VALUES({item_code_db_col})"
+            if item_name_db_col:
+                update_sql = update_sql + f", {item_name_db_col}=VALUES({item_name_db_col})"
+            if maker_db_col:
+                update_sql = update_sql + f", {maker_db_col}=VALUES({maker_db_col})"
+            if unit_price_db_col:
+                update_sql = update_sql + f", {unit_price_db_col}=VALUES({unit_price_db_col})"
+            if channel_db_col:
+                update_sql = update_sql + f", {channel_db_col}=VALUES({channel_db_col})"
 
         placeholders = ", ".join(["%s"] * len(insert_cols))
         insert_sql = f"INSERT INTO sales_raw ({', '.join(insert_cols)}) VALUES ({placeholders}){update_sql}"
@@ -213,6 +290,16 @@ def _show_sales_upload():
                 corp_val = r["corp"]
                 corp_val = None if pd.isna(corp_val) else str(corp_val)
                 row.append(corp_val)
+            if item_code_db_col:
+                row.append(None if pd.isna(r["item_code"]) else str(r["item_code"]))
+            if item_name_db_col:
+                row.append(None if pd.isna(r["item_name"]) else str(r["item_name"]))
+            if maker_db_col:
+                row.append(None if pd.isna(r["maker"]) else str(r["maker"]))
+            if unit_price_db_col:
+                row.append(None if pd.isna(r["unit_price"]) else float(r["unit_price"]))
+            if channel_db_col:
+                row.append(None if pd.isna(r["channel"]) else str(r["channel"]))
             rows.append(tuple(row))
 
         progress = st.progress(0, text="DB 적재 준비...")
