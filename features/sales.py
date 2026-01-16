@@ -1,5 +1,6 @@
 # pages/sales.py
 from typing import List, Optional, Tuple
+import hashlib
 import re
 
 import pandas as pd
@@ -72,6 +73,15 @@ def _read_one_sheet_any_header(excel_source, sheet_name) -> pd.DataFrame:
     return df
 
 
+def compute_row_hash(*values) -> str:
+    h = hashlib.md5()
+    for v in values:
+        s = "" if v is None else str(v)
+        h.update(s.encode("utf-8"))
+        h.update(b"\x1f")
+    return h.hexdigest()
+
+
 @st.cache_data(ttl=300)
 def load_sales_all_sheets(upload_or_path) -> pd.DataFrame:
     xls = pd.ExcelFile(upload_or_path, engine="openpyxl")
@@ -120,8 +130,37 @@ def detect_amount_col(df: pd.DataFrame) -> Optional[str]:
     return _find_col_by_tokens(df.columns, tokens)
 
 
+def detect_corp_col(df: pd.DataFrame) -> Optional[str]:
+    tokens = ["구분", "법인", "매출구분", "채널", "channel", "corp", "division"]
+    return _find_col_by_tokens(df.columns, tokens)
+
+
+def find_sales_raw_corp_col(sales_cols: set[str]) -> Optional[str]:
+    tokens = ["구분", "법인", "매출구분", "채널", "sales_channel", "channel", "corp", "division"]
+    return _find_col_by_tokens(list(sales_cols), tokens)
+
+
+def find_sales_raw_customer_cols(sales_cols: set[str]) -> List[str]:
+    candidates = [
+        "customer_raw",
+        "customer_cd",
+        "customer",
+        "customer_name",
+        "customer_nm",
+        "cust_name",
+        "cust_nm",
+    ]
+    return [c for c in candidates if c in sales_cols]
+
+
 def pick_customer_col_for_sheet(df: pd.DataFrame, sheet: str) -> Optional[str]:
     if is_sheet_2425(sheet):
+        for candidates in [
+            ["통합(실제상호)", "통합상호", "실제상호", "통합", "통합명", "realname", "real_name"],
+        ]:
+            col = _find_col_by_tokens(df.columns, candidates)
+            if col:
+                return col
         for candidates in [
             ["사업자등록번호", "사업자번호", "사업자등록", "사업자", "businessno", "bizno", "biz_no"],
             ["사용상호", "거래처명", "거래처", "업체명", "상호", "customer", "client", "account", "buyer"],
@@ -132,6 +171,7 @@ def pick_customer_col_for_sheet(df: pd.DataFrame, sheet: str) -> Optional[str]:
         return None
 
     for candidates in [
+        ["통합(실제상호)", "통합상호", "실제상호", "통합", "통합명", "realname", "real_name"],
         ["거래처명", "거래처", "업체명", "상호", "사용상호", "customer", "client", "account", "buyer"],
         ["사업자등록번호", "사업자번호", "사업자", "businessno", "bizno", "biz_no"],
     ]:
@@ -152,16 +192,44 @@ def show_sales_report_page():
     has_alias = _table_exists("customer_alias")
     has_master = _table_exists("customer_master")
 
+    sales_cols = get_columns("sales_raw")
+    customer_cols = find_sales_raw_customer_cols(sales_cols)
+    if not customer_cols:
+        st.error("sales_raw에 고객 컬럼(customer_raw/customer_cd)이 없습니다.")
+        return
+    customer_src_col = customer_cols[0]
+    customer_join_col = "customer_raw" if "customer_raw" in sales_cols else customer_src_col
+
     brand_expr = "'(UNKNOWN)'"
-    brand_note = "(customer_master에 브랜드 컬럼 없음)"
+    brand_note = "(customer_master 메이커 컬럼 없음)"
+    corp_expr = "'(UNKNOWN)'"
+    corp_note = "(sales_raw 구분 컬럼 없음)"
     if has_master:
         master_cols = get_columns("customer_master")
-        brand_col = next((c for c in ["brand", "brand_name", "brand_nm", "브랜드"] if c in master_cols), None)
+        brand_col = next(
+            (c for c in ["maker", "brand", "brand_name", "brand_nm", "maker_name", "manufacturer", "메이커", "브랜드", "제조사"] if c in master_cols),
+            None,
+        )
         if brand_col:
             brand_expr = f"IFNULL(NULLIF(TRIM(cm.{brand_col}),''), '(UNKNOWN)')"
             brand_note = f"(customer_master.{brand_col} 기준)"
+        # corp prefers sales_raw when available to match Excel "구분"
 
-    customer_expr = "COALESCE(cm.display_name, sr.customer_raw)"
+    corp_col = find_sales_raw_corp_col(sales_cols)
+    if corp_col:
+        corp_expr = f"IFNULL(NULLIF(TRIM(sr.{corp_col}),''), '(UNKNOWN)')"
+        corp_note = f"(sales_raw.{corp_col} 기준)"
+    elif has_master:
+        master_cols = get_columns("customer_master")
+        cm_corp_col = next(
+            (c for c in ["sales_channel", "channel", "corp", "corp_type", "corp_kind", "division", "구분", "법인"] if c in master_cols),
+            None,
+        )
+        if cm_corp_col:
+            corp_expr = f"IFNULL(NULLIF(TRIM(cm.{cm_corp_col}),''), '(UNKNOWN)')"
+            corp_note = f"(customer_master.{cm_corp_col} 기준)"
+
+    customer_expr = f"COALESCE(NULLIF(TRIM(sr.{customer_src_col}),''), cm.display_name)"
 
     if has_alias and has_master:
         base_df = query_df(
@@ -170,22 +238,24 @@ def show_sales_report_page():
               sr.year,
               {customer_expr} AS customer,
               {brand_expr} AS brand,
+              {corp_expr} AS corp,
               SUM(sr.amount) AS amount
             FROM sales_raw sr
-            LEFT JOIN customer_alias ca ON ca.alias_name = sr.customer_raw
+            LEFT JOIN customer_alias ca ON ca.alias_name = sr.{customer_join_col}
             LEFT JOIN customer_master cm ON cm.id = ca.customer_id
-            GROUP BY sr.year, {customer_expr}, {brand_expr}
+            GROUP BY sr.year, {customer_expr}, {brand_expr}, {corp_expr}
             ORDER BY sr.year DESC, amount DESC
             """
         )
-        st.caption(f"연도/업체/브랜드 집계 {brand_note}")
+        st.caption(f"연도/업체/구분/메이커 집계 {brand_note} {corp_note}")
     else:
         base_df = query_df(
             """
             SELECT
               sr.year,
-              sr.customer_raw AS customer,
+              sr.{customer_join_col} AS customer,
               '(UNKNOWN)' AS brand,
+              '(UNKNOWN)' AS corp,
               SUM(sr.amount) AS amount
             FROM sales_raw sr
             GROUP BY sr.year, sr.customer_raw
@@ -200,14 +270,17 @@ def show_sales_report_page():
         base_df = base_df.copy()
         base_df["year"] = pd.to_numeric(base_df["year"], errors="coerce").astype("Int64")
         base_df["brand"] = base_df["brand"].fillna("(UNKNOWN)")
+        base_df["corp"] = base_df["corp"].fillna("(UNKNOWN)")
 
         years = sorted([int(y) for y in base_df["year"].dropna().unique()], reverse=True)
         brands = sorted(base_df["brand"].dropna().astype(str).unique().tolist())
+        corps = sorted(base_df["corp"].dropna().astype(str).unique().tolist())
         customers = sorted(base_df["customer"].dropna().astype(str).unique().tolist())
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         sel_years = c1.multiselect("연도 선택(다중)", years, default=years)
-        sel_brands = c2.multiselect("브랜드(메이커) 선택", brands, default=brands)
+        sel_brands = c2.multiselect("메이커 선택", brands, default=brands)
+        sel_corps = c3.multiselect("구분(법인) 선택", corps, default=corps)
         sel_customers = st.multiselect("업체 선택 (다중)", customers, default=customers)
 
         view = base_df
@@ -215,10 +288,12 @@ def show_sales_report_page():
             view = view[view["year"].isin(sel_years)]
         if sel_brands:
             view = view[view["brand"].isin(sel_brands)]
+        if sel_corps:
+            view = view[view["corp"].isin(sel_corps)]
         if sel_customers:
             view = view[view["customer"].isin(sel_customers)]
 
-        st.caption("브랜드 = 메이커, 연도/브랜드/업체 멀티선택 필터 적용")
+        st.caption("메이커/구분/연도/업체 멀티선택 필터 적용")
 
         if view.empty:
             st.info("선택한 조건에 해당하는 데이터가 없습니다.")
@@ -227,7 +302,6 @@ def show_sales_report_page():
             st.metric("업체 수", f"{view['customer'].nunique():,}")
             st.metric("금액 합계", f"{int(view['amount'].sum()):,}")
             render_table(view.sort_values(["year", "amount"], ascending=[False, False]), number_cols=["amount"])
-
     st.divider()
 
     with st.expander("옵션: 매출 데이터 엑셀 업로드/재적재", expanded=False):
@@ -245,85 +319,146 @@ def show_sales_report_page():
             st.info("엑셀 파일을 올리지 않으면 DB 데이터 그대로 사용합니다.")
             return
 
-        raw = load_sales_all_sheets(up)
+        delete_before = st.checkbox("Delete sales_raw before load (DELETE)", value=False)
+        only_2020_2025 = st.checkbox("Only load 2020-2025", value=True)
 
-        year_col = detect_year_col(raw)
-        amount_col = detect_amount_col(raw)
-        if not year_col:
-            st.error("엑셀에서 '년도'/'연도' 컬럼을 찾지 못했습니다.")
-            return
-        if not amount_col:
-            st.error("엑셀에서 금액 컬럼(공급가액/매출액/금액 등)을 찾지 못했습니다.")
-            return
+        if st.button("Load into DB"):
+            status = st.status("엑셀 로딩 및 전처리 중...", expanded=True)
+            with st.spinner("Loading Excel and preprocessing..."):
+                raw = load_sales_all_sheets(up)
 
-        delete_before = st.checkbox("적재 전 sales_raw 비우기(DELETE)", value=False)
-        only_2020_2025 = st.checkbox("2020~2025만 적재", value=True)
+                year_col = detect_year_col(raw)
+                amount_col = detect_amount_col(raw)
+                if not year_col:
+                    st.error("Could not find a year column in the Excel file.")
+                    return
+                if not amount_col:
+                    st.error("Could not find an amount column in the Excel file.")
+                    return
 
-        df = raw.copy()
-        df["year"] = df[year_col].apply(parse_year)
-        df["amount"] = pd.to_numeric(df[amount_col], errors="coerce")
-        df["customer_col"] = None
-        df["customer_raw"] = pd.NA
+                df = raw.copy()
+                df["year"] = df[year_col].apply(parse_year)
+                df["amount"] = pd.to_numeric(df[amount_col], errors="coerce")
+                df["customer_col"] = ""
+                df["customer_raw"] = pd.NA
+                df["corp"] = pd.NA
 
-        for idx, r in df.iterrows():
-            sheet = str(r["_sheet"])
-            cust_col = pick_customer_col_for_sheet(df, sheet)
-            df.at[idx, "customer_col"] = cust_col or ""
-            if cust_col and cust_col in df.columns:
-                df.at[idx, "customer_raw"] = r.get(cust_col)
+                corp_col = detect_corp_col(raw)
+                if corp_col and corp_col in df.columns:
+                    df["corp"] = df[corp_col]
 
-        df["customer_raw"] = normalize_str_series(df["customer_raw"])
-        df = df[df["year"].notna() & df["amount"].notna() & df["customer_raw"].notna()]
-        df["year"] = df["year"].astype(int)
+                sheet_to_cust = {}
+                for sheet in df["_sheet"].astype(str).unique().tolist():
+                    cust_col = pick_customer_col_for_sheet(df, sheet)
+                    sheet_to_cust[sheet] = cust_col or ""
 
-        if only_2020_2025:
-            df = df[df["year"].between(2020, 2025, inclusive="both")]
+                for sheet, cust_col in sheet_to_cust.items():
+                    mask = df["_sheet"].astype(str) == sheet
+                    df.loc[mask, "customer_col"] = cust_col or ""
+                    if cust_col and cust_col in df.columns:
+                        df.loc[mask, "customer_raw"] = df.loc[mask, cust_col]
 
-        st.subheader("적재 대상 미리보기 (상위 200행)")
-        st.dataframe(
-            df[["_sheet", "year", "customer_raw", "amount", "customer_col"]].head(200),
-            use_container_width=True,
-            hide_index=True,
-        )
+                df["customer_raw"] = normalize_str_series(df["customer_raw"])
+                df["corp"] = normalize_str_series(df["corp"])
+                df = df[df["year"].notna() & df["amount"].notna() & df["customer_raw"].notna()]
+                df["year"] = df["year"].astype(int)
 
-        k1, k2, k3 = st.columns(3)
-        k1.metric("적재 대상 행 수", f"{len(df):,}")
-        k2.metric("거래처(원문) 수", f"{df['customer_raw'].nunique():,}")
-        k3.metric("금액 합계", f"{int(df['amount'].sum()):,}")
-
-        if st.button("↳ DB 적재 실행"):
+                if only_2020_2025:
+                    df = df[df["year"].between(2020, 2025, inclusive="both")]
+            status.write(f"전처리 완료: {len(df):,} rows")
             if delete_before:
+                status.write("기존 데이터 삭제 중...")
                 deleted = exec_sql("DELETE FROM sales_raw")
-                st.info(f"sales_raw 삭제: {deleted:,} rows")
+                status.write(f"sales_raw 삭제: {deleted:,} rows")
+            else:
+                status.write("기존 데이터 삭제: 건너뜀")
 
-            insert_sql = """
-            INSERT INTO sales_raw (src_file, sheet_name, year, customer_raw, amount, customer_col)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            """
+            sales_cols = get_columns("sales_raw")
+            use_row_hash = "row_hash" in sales_cols
+            corp_db_col = find_sales_raw_corp_col(sales_cols)
+            customer_cols = find_sales_raw_customer_cols(sales_cols)
+            if not customer_cols:
+                status.update(label="고객 컬럼 없음", state="error", expanded=True)
+                st.error("sales_raw에 고객 컬럼(customer_raw/customer_cd)이 없습니다.")
+                return
+            customer_alias_col = "customer_raw" if "customer_raw" in sales_cols else customer_cols[0]
+            if corp_col and not corp_db_col:
+                status.write("주의: sales_raw에 구분 컬럼이 없어 엑셀 구분 값을 저장하지 못합니다.")
+
+            insert_cols = []
+            if use_row_hash:
+                insert_cols.append("row_hash")
+            insert_cols += ["src_file", "sheet_name", "year"]
+            insert_cols += customer_cols
+            insert_cols += ["amount", "customer_col"]
+            if corp_db_col:
+                insert_cols.append(corp_db_col)
+
+            update_sql = ""
+            if use_row_hash:
+                update_sql = " ON DUPLICATE KEY UPDATE row_hash = row_hash"
+                if corp_db_col:
+                    update_sql = update_sql + f", {corp_db_col}=VALUES({corp_db_col})"
+
+            placeholders = ", ".join(["%s"] * len(insert_cols))
+            insert_sql = f"INSERT INTO sales_raw ({', '.join(insert_cols)}) VALUES ({placeholders}){update_sql}"
 
             rows: List[Tuple] = []
             src_file_label = getattr(up, "name", "uploaded.xlsx")
             for _, r in df.iterrows():
-                rows.append(
-                    (
-                        src_file_label,
-                        str(r["_sheet"]),
-                        int(r["year"]),
-                        str(r["customer_raw"]),
-                        float(r["amount"]),
-                        str(r["customer_col"]),
-                    )
+                customer_val = str(r["customer_raw"])
+                base_hash = (
+                    src_file_label,
+                    str(r["_sheet"]),
+                    int(r["year"]),
+                    customer_val,
+                    float(r["amount"]),
+                    str(r["customer_col"]),
                 )
 
-            inserted = exec_many(insert_sql, rows)
+                row = []
+                if use_row_hash:
+                    row.append(compute_row_hash(*base_hash))
+                row.extend([src_file_label, str(r["_sheet"]), int(r["year"])])
+                row.extend([customer_val] * len(customer_cols))
+                row.append(float(r["amount"]))
+                row.append(str(r["customer_col"]))
+                if corp_db_col:
+                    corp_val = r["corp"]
+                    corp_val = None if pd.isna(corp_val) else str(corp_val)
+                    row.append(corp_val)
+                rows.append(tuple(row))
+
+            progress = st.progress(0, text="DB 적재 준비...")
+            status_text = st.empty()
+
+            def _fmt_time(seconds: float | None) -> str:
+                if seconds is None:
+                    return "계산중"
+                seconds = max(0, int(seconds))
+                m, s = divmod(seconds, 60)
+                h, m = divmod(m, 60)
+                if h > 0:
+                    return f"{h}h {m:02d}m"
+                return f"{m}m {s:02d}s"
+
+            def _progress_cb(done: int, total: int, elapsed: float) -> None:
+                frac = (done / total) if total else 1.0
+                remaining = (elapsed / done) * (total - done) if done else None
+                progress.progress(min(frac, 1.0), text=f"DB 적재 {done:,}/{total:,} ({frac*100:.1f}%)")
+                status_text.write(f"경과 {_fmt_time(elapsed)} | 남은시간 {_fmt_time(remaining)}")
+
+            inserted = exec_many(insert_sql, rows, progress_cb=_progress_cb)
+            progress.progress(1.0, text="DB 적재 완료")
             st.success(f"sales_raw 적재 완료: {inserted:,} rows")
+            status.update(label="DB 적재 완료", state="complete", expanded=False)
 
             exec_sql(
-                """
+                f"""
                 INSERT INTO customer_alias (alias_name, src_hint)
-                SELECT DISTINCT customer_raw, customer_col
+                SELECT DISTINCT {customer_alias_col}, customer_col
                 FROM sales_raw
-                WHERE customer_raw IS NOT NULL AND TRIM(customer_raw) <> ''
+                WHERE {customer_alias_col} IS NOT NULL AND TRIM({customer_alias_col}) <> ''
                 ON DUPLICATE KEY UPDATE src_hint = VALUES(src_hint)
                 """
             )

@@ -1,6 +1,7 @@
 import pandas as pd
 import mysql.connector
-from typing import Tuple, List
+import time
+from typing import Tuple, List, Callable, Optional
 
 from core.config import (
     DB_HOST, DB_USER, DB_PASS, DB_NAME, DB_PORT
@@ -38,7 +39,12 @@ def exec_sql(sql: str, params: Tuple = ()) -> int:
     finally:
         conn.close()
 
-def exec_many(sql: str, rows: List[Tuple], batch_size: int = 1000) -> int:
+def exec_many(
+    sql: str,
+    rows: List[Tuple],
+    batch_size: int = 1000,
+    progress_cb: Optional[Callable[[int, int, float], None]] = None,
+) -> int:
     if not rows:
         return 0
     if batch_size <= 0:
@@ -47,11 +53,15 @@ def exec_many(sql: str, rows: List[Tuple], batch_size: int = 1000) -> int:
     try:
         cur = conn.cursor()
         total = 0
+        start = time.monotonic()
         for i in range(0, len(rows), batch_size):
             batch = rows[i : i + batch_size]
             cur.executemany(sql, batch)
             conn.commit()
             total += len(batch)
+            if progress_cb:
+                elapsed = time.monotonic() - start
+                progress_cb(total, len(rows), elapsed)
         return total
     finally:
         conn.close()

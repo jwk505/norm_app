@@ -13,6 +13,10 @@ from features.sales import (
     load_sales_all_sheets,
     detect_amount_col,
     detect_year_col,
+    detect_corp_col,
+    find_sales_raw_corp_col,
+    find_sales_raw_customer_cols,
+    compute_row_hash,
     normalize_str_series,
     parse_year,
     pick_customer_col_for_sheet,
@@ -99,87 +103,148 @@ def _show_sales_upload():
 
     up = st.file_uploader("매출 엑셀 업로드", type=["xlsx"], key="sales_upload")
     if up is None:
-        st.info("엑셀 파일을 업로드하면 미리보기와 적재 옵션이 표시됩니다.")
+        st.info("엑셀 파일을 업로드하면 적재 옵션이 표시됩니다.")
         return
 
-    raw = load_sales_all_sheets(up)
-    year_col = detect_year_col(raw)
-    amount_col = detect_amount_col(raw)
-    if not year_col:
-        st.error("엑셀에서 '년도/연도' 컬럼을 찾지 못했습니다.")
-        return
-    if not amount_col:
-        st.error("엑셀에서 금액 컬럼을 찾지 못했습니다.")
-        return
+    delete_before = st.checkbox("Delete sales_raw before load (DELETE)", value=False, key="sales_delete")
+    only_2020_2025 = st.checkbox("Only load 2020-2025", value=True, key="sales_range")
 
-    delete_before = st.checkbox("적재 전 sales_raw 비우기(DELETE)", value=False, key="sales_delete")
-    only_2020_2025 = st.checkbox("2020~2025만 적재", value=True, key="sales_range")
+    if st.button("Load into DB", key="sales_upload_btn"):
+        status = st.status("엑셀 로딩 및 전처리 중...", expanded=True)
+        with st.spinner("Loading Excel and preprocessing..."):
+            raw = load_sales_all_sheets(up)
+            year_col = detect_year_col(raw)
+            amount_col = detect_amount_col(raw)
+            if not year_col:
+                st.error("Could not find a year column in the Excel file.")
+                return
+            if not amount_col:
+                st.error("Could not find an amount column in the Excel file.")
+                return
 
-    df = raw.copy()
-    df["year"] = df[year_col].apply(parse_year)
-    df["amount"] = pd.to_numeric(df[amount_col], errors="coerce")
-    df["customer_col"] = None
-    df["customer_raw"] = pd.NA
+            df = raw.copy()
+            df["year"] = df[year_col].apply(parse_year)
+            df["amount"] = pd.to_numeric(df[amount_col], errors="coerce")
+            df["customer_col"] = ""
+            df["customer_raw"] = pd.NA
+            df["corp"] = pd.NA
 
-    for idx, r in df.iterrows():
-        sheet = str(r["_sheet"])
-        cust_col = pick_customer_col_for_sheet(df, sheet)
-        df.at[idx, "customer_col"] = cust_col or ""
-        if cust_col and cust_col in df.columns:
-            df.at[idx, "customer_raw"] = r.get(cust_col)
+            corp_col = detect_corp_col(raw)
+            if corp_col and corp_col in df.columns:
+                df["corp"] = df[corp_col]
 
-    df["customer_raw"] = normalize_str_series(df["customer_raw"])
-    df = df[df["year"].notna() & df["amount"].notna() & df["customer_raw"].notna()]
-    df["year"] = df["year"].astype(int)
+            sheet_to_cust = {}
+            for sheet in df["_sheet"].astype(str).unique().tolist():
+                cust_col = pick_customer_col_for_sheet(df, sheet)
+                sheet_to_cust[sheet] = cust_col or ""
 
-    if only_2020_2025:
-        df = df[df["year"].between(2020, 2025, inclusive="both")]
+            for sheet, cust_col in sheet_to_cust.items():
+                mask = df["_sheet"].astype(str) == sheet
+                df.loc[mask, "customer_col"] = cust_col or ""
+                if cust_col and cust_col in df.columns:
+                    df.loc[mask, "customer_raw"] = df.loc[mask, cust_col]
 
-    st.caption("적재 데이터 미리보기 (상위 200행)")
-    st.dataframe(
-        df[["_sheet", "year", "customer_raw", "amount", "customer_col"]].head(200),
-        use_container_width=True,
-        hide_index=True,
-    )
+            df["customer_raw"] = normalize_str_series(df["customer_raw"])
+            df["corp"] = normalize_str_series(df["corp"])
+            df = df[df["year"].notna() & df["amount"].notna() & df["customer_raw"].notna()]
+            df["year"] = df["year"].astype(int)
 
-    k1, k2, k3 = st.columns(3)
-    k1.metric("적재 건수", f"{len(df):,}")
-    k2.metric("거래처 수", f"{df['customer_raw'].nunique():,}")
-    k3.metric("금액 합계", f"{int(df['amount'].sum()):,}")
-
-    if st.button("DB 적재 실행", key="sales_upload_btn"):
+            if only_2020_2025:
+                df = df[df["year"].between(2020, 2025, inclusive="both")]
+        status.write(f"전처리 완료: {len(df):,} rows")
         if delete_before:
+            status.write("기존 데이터 삭제 중...")
             deleted = exec_sql("DELETE FROM sales_raw")
-            st.info(f"sales_raw 삭제: {deleted:,} rows")
+            status.write(f"sales_raw 삭제: {deleted:,} rows")
+        else:
+            status.write("기존 데이터 삭제: 건너뜀")
 
-        insert_sql = """
-        INSERT INTO sales_raw (src_file, sheet_name, year, customer_raw, amount, customer_col)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """
+        sales_cols = get_columns("sales_raw")
+        use_row_hash = "row_hash" in sales_cols
+        corp_db_col = find_sales_raw_corp_col(sales_cols)
+        customer_cols = find_sales_raw_customer_cols(sales_cols)
+        if not customer_cols:
+            status.update(label="고객 컬럼 없음", state="error", expanded=True)
+            st.error("sales_raw에 고객 컬럼(customer_raw/customer_cd)이 없습니다.")
+            return
+        customer_alias_col = "customer_raw" if "customer_raw" in sales_cols else customer_cols[0]
+        if corp_col and not corp_db_col:
+            status.write("주의: sales_raw에 구분 컬럼이 없어 엑셀 구분 값을 저장하지 못합니다.")
+
+        insert_cols = []
+        if use_row_hash:
+            insert_cols.append("row_hash")
+        insert_cols += ["src_file", "sheet_name", "year"]
+        insert_cols += customer_cols
+        insert_cols += ["amount", "customer_col"]
+        if corp_db_col:
+            insert_cols.append(corp_db_col)
+
+        update_sql = ""
+        if use_row_hash:
+            update_sql = " ON DUPLICATE KEY UPDATE row_hash = row_hash"
+            if corp_db_col:
+                update_sql = update_sql + f", {corp_db_col}=VALUES({corp_db_col})"
+
+        placeholders = ", ".join(["%s"] * len(insert_cols))
+        insert_sql = f"INSERT INTO sales_raw ({', '.join(insert_cols)}) VALUES ({placeholders}){update_sql}"
 
         rows = []
         src_file_label = getattr(up, "name", "uploaded.xlsx")
         for _, r in df.iterrows():
-            rows.append(
-                (
-                    src_file_label,
-                    str(r["_sheet"]),
-                    int(r["year"]),
-                    str(r["customer_raw"]),
-                    float(r["amount"]),
-                    str(r["customer_col"]),
-                )
+            customer_val = str(r["customer_raw"])
+            base_hash = (
+                src_file_label,
+                str(r["_sheet"]),
+                int(r["year"]),
+                customer_val,
+                float(r["amount"]),
+                str(r["customer_col"]),
             )
 
-        inserted = exec_many(insert_sql, rows)
+            row = []
+            if use_row_hash:
+                row.append(compute_row_hash(*base_hash))
+            row.extend([src_file_label, str(r["_sheet"]), int(r["year"])])
+            row.extend([customer_val] * len(customer_cols))
+            row.append(float(r["amount"]))
+            row.append(str(r["customer_col"]))
+            if corp_db_col:
+                corp_val = r["corp"]
+                corp_val = None if pd.isna(corp_val) else str(corp_val)
+                row.append(corp_val)
+            rows.append(tuple(row))
+
+        progress = st.progress(0, text="DB 적재 준비...")
+        status_text = st.empty()
+
+        def _fmt_time(seconds: float | None) -> str:
+            if seconds is None:
+                return "계산중"
+            seconds = max(0, int(seconds))
+            m, s = divmod(seconds, 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h}h {m:02d}m"
+            return f"{m}m {s:02d}s"
+
+        def _progress_cb(done: int, total: int, elapsed: float) -> None:
+            frac = (done / total) if total else 1.0
+            remaining = (elapsed / done) * (total - done) if done else None
+            progress.progress(min(frac, 1.0), text=f"DB 적재 {done:,}/{total:,} ({frac*100:.1f}%)")
+            status_text.write(f"경과 {_fmt_time(elapsed)} | 남은시간 {_fmt_time(remaining)}")
+
+        inserted = exec_many(insert_sql, rows, progress_cb=_progress_cb)
+        progress.progress(1.0, text="DB 적재 완료")
         st.success(f"sales_raw 적재 완료: {inserted:,} rows")
+        status.update(label="DB 적재 완료", state="complete", expanded=False)
 
         exec_sql(
-            """
+            f"""
             INSERT INTO customer_alias (alias_name, src_hint)
-            SELECT DISTINCT customer_raw, customer_col
+            SELECT DISTINCT {customer_alias_col}, customer_col
             FROM sales_raw
-            WHERE customer_raw IS NOT NULL AND TRIM(customer_raw) <> ''
+            WHERE {customer_alias_col} IS NOT NULL AND TRIM({customer_alias_col}) <> ''
             ON DUPLICATE KEY UPDATE src_hint = VALUES(src_hint)
             """
         )
