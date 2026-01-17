@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import io
+import os
+import re
 from typing import Optional
 
 import pandas as pd
@@ -9,6 +12,7 @@ import streamlit as st
 
 from core.db import exec_many, exec_sql, query_df
 from core.schema import get_columns
+from features.finance import ensure_finance_tables
 from features.sales import (
     load_sales_all_sheets,
     detect_amount_col,
@@ -105,6 +109,152 @@ def _to_decimal(x):
         return None
 
 
+def _otsu_threshold(img) -> int:
+    hist = img.histogram()
+    total = sum(hist)
+    sum_total = 0
+    for i in range(256):
+        sum_total += i * hist[i]
+    sum_b = 0
+    w_b = 0
+    max_var = 0.0
+    threshold = 160
+    for i in range(256):
+        w_b += hist[i]
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += i * hist[i]
+        m_b = sum_b / w_b
+        m_f = (sum_total - sum_b) / w_f
+        var_between = w_b * w_f * (m_b - m_f) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            threshold = i
+    return threshold
+
+
+def _ensure_tesseract_cmd():
+    candidates = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                import pytesseract
+
+                pytesseract.pytesseract.tesseract_cmd = p
+            except Exception:
+                pass
+            break
+    user_tessdata = os.path.join(os.path.expanduser("~"), ".tesseract", "tessdata")
+    if os.path.isdir(user_tessdata):
+        os.environ["TESSDATA_PREFIX"] = user_tessdata
+
+
+def _ocr_score(text: str) -> float:
+    if not text:
+        return 0.0
+    good = len(re.findall(r"[가-힣A-Za-z0-9]", text))
+    return good / max(1, len(text))
+
+
+def _map_statement_type(val: str) -> str:
+    s = str(val).strip().lower()
+    if "손익" in s or s in ("is", "pl", "p/l"):
+        return "IS"
+    if "대차" in s or "재무상태" in s or s in ("bs", "b/s"):
+        return "BS"
+    if "현금" in s or "cash" in s or s in ("cf", "c/f"):
+        return "CF"
+    return str(val).strip() or "UNKNOWN"
+
+
+def _normalize_period(val) -> str | None:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, (datetime, pd.Timestamp)):
+        return val.strftime("%Y-%m")
+    s = str(val).strip()
+    if not s:
+        return None
+    m = re.search(r"(20\d{2})(?:\D{0,3}(\d{1,2}))?", s)
+    if m:
+        y = m.group(1)
+        mm = m.group(2)
+        if mm:
+            return f"{y}-{int(mm):02d}"
+        return y
+    if s.isdigit():
+        return s
+    return s
+
+
+def _ingest_financial_rows(load_df: pd.DataFrame, source_file: str, sheet_name: str, delete_before: bool) -> None:
+    if load_df.empty:
+        st.warning("적재 대상 데이터가 없습니다.")
+        return
+
+    corp_names = load_df["_corp"].dropna().astype(str).unique().tolist()
+    exec_many(
+        """
+        INSERT INTO financial_corp (corp_name)
+        VALUES (%s)
+        ON DUPLICATE KEY UPDATE corp_name=corp_name
+        """,
+        [(c,) for c in corp_names],
+    )
+
+    corp_map = query_df(
+        "SELECT id, corp_name FROM financial_corp WHERE corp_name IN ({})".format(
+            ",".join(["%s"] * len(corp_names))
+        ),
+        tuple(corp_names),
+    )
+    corp_id_map = {r.corp_name: int(r.id) for r in corp_map.itertuples(index=False)}
+
+    if delete_before:
+        exec_sql(
+            """
+            DELETE s
+            FROM financial_statement s
+            JOIN financial_corp c ON c.id = s.corp_id
+            WHERE s.source_file = %s AND s.sheet_name = %s
+            """,
+            (source_file, sheet_name),
+        )
+
+    insert_sql = """
+        INSERT INTO financial_statement
+        (corp_id, period, statement_type, account_name, amount, source_file, sheet_name)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    rows = []
+    for _, r in load_df.iterrows():
+        corp_id = corp_id_map.get(str(r["_corp"]))
+        if not corp_id:
+            continue
+        rows.append(
+            (
+                corp_id,
+                str(r["_period"]),
+                str(r["_stmt"]),
+                str(r["_account"]),
+                float(r["_amount"]),
+                source_file,
+                sheet_name,
+            )
+        )
+
+    inserted = exec_many(insert_sql, rows)
+    st.success(f"재무제표 적재 완료: {inserted:,} rows")
+    st.cache_data.clear()
+    st.rerun()
+
+
 def _show_sales_upload():
     st.subheader("매출 업로드 (.xlsx)")
     needed = ["sales_raw", "customer_master", "customer_alias"]
@@ -168,6 +318,12 @@ def _show_sales_upload():
                 if cust_col and cust_col in df.columns:
                     df.loc[mask, "customer_raw"] = df.loc[mask, cust_col]
 
+            cust_map = pd.DataFrame(
+                [{"sheet": k, "customer_col": v or ""} for k, v in sheet_to_cust.items()]
+            )
+            st.caption("시트별 고객 컬럼 감지 결과")
+            st.dataframe(cust_map, use_container_width=True, hide_index=True)
+
             df["customer_raw"] = normalize_str_series(df["customer_raw"])
             df["corp"] = normalize_str_series(df["corp"])
             df["channel"] = normalize_str_series(df["channel"])
@@ -175,7 +331,27 @@ def _show_sales_upload():
             df["item_name"] = normalize_str_series(df["item_name"])
             df["maker"] = normalize_str_series(df["maker"])
             df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce")
-            df = df[df["year"].notna() & df["amount"].notna() & df["customer_raw"].notna()]
+
+            total_rows = len(df)
+            mask_year = df["year"].notna()
+            mask_amount = df["amount"].notna()
+            mask_customer = df["customer_raw"].notna()
+            drop_stats = pd.DataFrame(
+                [
+                    {"항목": "전체", "행수": total_rows},
+                    {"항목": "연도 없음", "행수": int((~mask_year).sum())},
+                    {"항목": "금액 없음", "행수": int((~mask_amount).sum())},
+                    {"항목": "고객 없음", "행수": int((~mask_customer).sum())},
+                    {
+                        "항목": "적재 대상",
+                        "행수": int((mask_year & mask_amount & mask_customer).sum()),
+                    },
+                ]
+            )
+            st.caption("전처리 제외 사유별 집계")
+            st.dataframe(drop_stats, use_container_width=True, hide_index=True)
+
+            df = df[mask_year & mask_amount & mask_customer]
             df["year"] = df["year"].astype(int)
 
             if only_2020_2025:
@@ -489,6 +665,249 @@ def _show_inventory_upload():
         st.rerun()
 
 
+def _show_financial_upload():
+    st.subheader("재무제표 업로드 (.xlsx)")
+    ensure_finance_tables()
+
+    template_df = pd.DataFrame(
+        [
+            {"법인": "ABC", "기간": "2024-12", "구분": "손익", "계정": "매출액", "금액": 1000000},
+            {"법인": "ABC", "기간": "2024-12", "구분": "손익", "계정": "영업이익", "금액": 120000},
+            {"법인": "ABC", "기간": "2024-12", "구분": "대차", "계정": "자산총계", "금액": 2500000},
+        ]
+    )
+    buf = io.BytesIO()
+    template_df.to_excel(buf, index=False, sheet_name="FINANCE", engine="openpyxl")
+    st.download_button(
+        "재무제표 업로드 양식 다운로드",
+        data=buf.getvalue(),
+        file_name="financial_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    up = st.file_uploader("재무제표 엑셀 업로드", type=["xlsx"], key="fin_upload")
+    if up is None:
+        st.info("엑셀 파일을 업로드하면 적재 옵션이 표시됩니다.")
+    else:
+        try:
+            xls = pd.ExcelFile(up, engine="openpyxl")
+            sheet_name = st.selectbox("시트 선택", xls.sheet_names, index=0, key="fin_sheet")
+            df = pd.read_excel(up, sheet_name=sheet_name, header=0, engine="openpyxl")
+        except Exception as e:
+            st.error(f"엑셀을 읽지 못했습니다: {e}")
+            df = None
+        if df is not None:
+            df.columns = [str(c).strip() if pd.notna(c) else "" for c in df.columns]
+            try:
+                corp_col = _find_col(df, ["법인", "법인명", "회사", "회사명", "기업", "corp", "entity"], required=True)
+                period_col = _find_col(df, ["기간", "연도", "년도", "결산기", "기준기간", "period", "year"], required=True)
+                stmt_col = _find_col(df, ["구분", "재무제표", "재무제표구분", "statement", "type"], required=True)
+                account_col = _find_col(df, ["계정", "계정과목", "항목", "account", "account_name"], required=True)
+                amount_col = _find_col(df, ["금액", "amount", "값", "금액(원)"], required=True)
+            except RuntimeError as e:
+                st.error(str(e))
+                corp_col = period_col = stmt_col = account_col = amount_col = None
+            if corp_col and period_col and stmt_col and account_col and amount_col:
+                df["_corp"] = df[corp_col].astype("string").str.strip()
+                df["_period"] = df[period_col].apply(_normalize_period)
+                df["_stmt"] = df[stmt_col].apply(_map_statement_type)
+                df["_account"] = df[account_col].astype("string").str.strip()
+                df["_amount"] = pd.to_numeric(df[amount_col].apply(_to_decimal), errors="coerce")
+
+                st.caption("적재 데이터 미리보기 (상위 200행)")
+                st.dataframe(
+                    df[[corp_col, period_col, stmt_col, account_col, amount_col]].head(200),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                total_rows = len(df)
+                mask_corp = df["_corp"].notna() & (df["_corp"] != "")
+                mask_period = df["_period"].notna() & (df["_period"] != "")
+                mask_account = df["_account"].notna() & (df["_account"] != "")
+                mask_amount = df["_amount"].notna()
+                drop_stats = pd.DataFrame(
+                    [
+                        {"항목": "전체", "행수": total_rows},
+                        {"항목": "법인 없음", "행수": int((~mask_corp).sum())},
+                        {"항목": "기간 없음", "행수": int((~mask_period).sum())},
+                        {"항목": "계정 없음", "행수": int((~mask_account).sum())},
+                        {"항목": "금액 없음", "행수": int((~mask_amount).sum())},
+                        {
+                            "항목": "적재 대상",
+                            "행수": int((mask_corp & mask_period & mask_account & mask_amount).sum()),
+                        },
+                    ]
+                )
+                st.caption("전처리 제외 사유별 집계")
+                st.dataframe(drop_stats, use_container_width=True, hide_index=True)
+
+                delete_before = st.checkbox("해당 시트 데이터 삭제 후 적재", value=False, key="fin_delete")
+
+                if st.button("DB 적재 실행", key="fin_upload_btn"):
+                    load_df = df[mask_corp & mask_period & mask_account & mask_amount].copy()
+                    _ingest_financial_rows(
+                        load_df,
+                        source_file=getattr(up, "name", "uploaded.xlsx"),
+                        sheet_name=str(sheet_name),
+                        delete_before=delete_before,
+                    )
+
+    st.divider()
+    st.subheader("재무제표 PDF 업로드 (실험)")
+    pdf_up = st.file_uploader("재무제표 PDF 업로드", type=["pdf"], key="fin_pdf_upload")
+    if pdf_up is None:
+        st.info("PDF를 업로드하면 페이지 선택 및 추출 옵션이 표시됩니다.")
+        return
+
+    try:
+        import pdfplumber
+        import pytesseract
+    except Exception as e:
+        st.error(f"PDF/OCR 라이브러리 로드 실패: {e}")
+        return
+
+    _ensure_tesseract_cmd()
+
+    with pdfplumber.open(pdf_up) as pdf_doc:
+        page_cnt = len(pdf_doc.pages)
+        if page_cnt == 0:
+            st.error("PDF 페이지를 읽지 못했습니다.")
+            return
+        page_no = st.number_input("페이지 선택", min_value=1, max_value=page_cnt, value=1, step=1)
+        page = pdf_doc.pages[int(page_no) - 1]
+
+        mode = st.radio("추출 방식", ["표 인식", "OCR"], horizontal=True)
+
+        if mode == "표 인식":
+            status = st.status("표 인식 중...", expanded=False)
+            table = page.extract_table()
+            status.update(label="표 인식 완료", state="complete", expanded=False)
+            if not table:
+                st.warning("표를 찾지 못했습니다. OCR 모드를 사용해 보세요.")
+                return
+            header = table[0]
+            rows = table[1:]
+            pdf_df = pd.DataFrame(rows, columns=header)
+            st.caption("추출 미리보기 (상위 200행)")
+            st.dataframe(pdf_df.head(200), use_container_width=True, hide_index=True)
+
+            st.caption("컬럼 매핑")
+            cols = list(pdf_df.columns)
+            corp_sel = st.selectbox("법인 컬럼", cols, index=0, key="pdf_corp_col")
+            period_sel = st.selectbox("기간 컬럼", cols, index=0, key="pdf_period_col")
+            stmt_sel = st.selectbox("구분 컬럼", cols, index=0, key="pdf_stmt_col")
+            account_sel = st.selectbox("계정 컬럼", cols, index=0, key="pdf_account_col")
+            amount_sel = st.selectbox("금액 컬럼", cols, index=0, key="pdf_amount_col")
+
+            delete_before_pdf = st.checkbox("해당 페이지 데이터 삭제 후 적재", value=False, key="fin_pdf_delete")
+            if st.button("PDF 적재 실행", key="fin_pdf_load"):
+                load_df = pd.DataFrame()
+                load_df["_corp"] = pdf_df[corp_sel].astype("string").str.strip()
+                load_df["_period"] = pdf_df[period_sel].apply(_normalize_period)
+                load_df["_stmt"] = pdf_df[stmt_sel].apply(_map_statement_type)
+                load_df["_account"] = pdf_df[account_sel].astype("string").str.strip()
+                load_df["_amount"] = pd.to_numeric(pdf_df[amount_sel].apply(_to_decimal), errors="coerce")
+                load_df = load_df[
+                    load_df["_corp"].notna()
+                    & (load_df["_corp"] != "")
+                    & load_df["_period"].notna()
+                    & (load_df["_period"] != "")
+                    & load_df["_account"].notna()
+                    & (load_df["_account"] != "")
+                    & load_df["_amount"].notna()
+                ]
+                _ingest_financial_rows(
+                    load_df,
+                    source_file=getattr(pdf_up, "name", "uploaded.pdf"),
+                    sheet_name=f"page_{page_no}",
+                    delete_before=delete_before_pdf,
+                )
+        else:
+            status = st.status("OCR 처리 중...", expanded=False)
+            image = page.to_image(resolution=350).original
+            try:
+                from PIL import Image, ImageEnhance, ImageFilter
+
+                gray = image.convert("L")
+                gray = ImageEnhance.Contrast(gray).enhance(2.0)
+                gray = gray.filter(ImageFilter.SHARPEN)
+                use_auto_thr = st.checkbox("자동 임계값(OTSU)", value=True, key="fin_ocr_auto_thr")
+                thr = _otsu_threshold(gray) if use_auto_thr else st.slider(
+                    "이진화 임계값", min_value=80, max_value=220, value=160, step=5, key="fin_ocr_thr"
+                )
+                bw = gray.point(lambda x: 0 if x < thr else 255, "1")
+                tessdata_dir = os.path.join(os.path.expanduser("~"), ".tesseract", "tessdata")
+                tessdata_arg = tessdata_dir.replace("\\", "/")
+                psm_pick = st.selectbox("OCR 모드(PSM)", ["자동", "4", "6", "11"], index=0, key="fin_ocr_psm")
+                psm_list = ["4", "6", "11"] if psm_pick == "자동" else [psm_pick]
+                best_text = ""
+                best_score = -1.0
+                for psm in psm_list:
+                    status.update(label=f"OCR 인식 중... (PSM {psm})", state="running", expanded=False)
+                    text = pytesseract.image_to_string(
+                        bw,
+                        lang="kor+eng",
+                        config=f"--oem 3 --psm {psm} --tessdata-dir {tessdata_arg}",
+                    )
+                    score = _ocr_score(text)
+                    if score > best_score:
+                        best_score = score
+                        best_text = text
+                ocr_text = best_text
+                status.update(label="OCR 완료", state="complete", expanded=False)
+            except Exception as e:
+                status.update(label="OCR 실패", state="error", expanded=False)
+                st.error(f"OCR 실패: {e}")
+                return
+
+            st.caption("OCR 텍스트 미리보기")
+            if not ocr_text or not ocr_text.strip():
+                st.warning("추출된 텍스트가 없습니다. 임계값/PSM을 조정하거나 다른 페이지로 시도해주세요.")
+            st.text_area("추출 결과", value=ocr_text or "", height=240)
+
+            c1, c2, c3 = st.columns(3)
+            corp_val = c1.text_input("법인(고정값)", value="")
+            period_val = c2.text_input("기간(고정값)", value="")
+            stmt_val = c3.text_input("구분(고정값)", value="손익")
+
+            lines = []
+            for raw in ocr_text.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                m = re.search(r"(-?\d[\d,]*)\s*$", line)
+                if not m:
+                    continue
+                amount_str = m.group(1)
+                account = line[: m.start()].strip()
+                if not account:
+                    continue
+                lines.append({"account": account, "amount": amount_str})
+            ocr_df = pd.DataFrame(lines)
+            st.caption("OCR 파싱 미리보기")
+            st.dataframe(ocr_df.head(200), use_container_width=True, hide_index=True)
+
+            delete_before_pdf = st.checkbox("해당 페이지 데이터 삭제 후 적재", value=False, key="fin_ocr_delete")
+            if st.button("OCR 적재 실행", key="fin_ocr_load"):
+                if not corp_val.strip() or not period_val.strip():
+                    st.warning("법인/기간 고정값을 입력해주세요.")
+                    return
+                load_df = pd.DataFrame()
+                load_df["_corp"] = corp_val.strip()
+                load_df["_period"] = _normalize_period(period_val.strip())
+                load_df["_stmt"] = _map_statement_type(stmt_val.strip())
+                load_df["_account"] = ocr_df["account"].astype("string").str.strip()
+                load_df["_amount"] = pd.to_numeric(ocr_df["amount"].apply(_to_decimal), errors="coerce")
+                load_df = load_df[load_df["_amount"].notna()]
+                _ingest_financial_rows(
+                    load_df,
+                    source_file=getattr(pdf_up, "name", "uploaded.pdf"),
+                    sheet_name=f"page_{page_no}",
+                    delete_before=delete_before_pdf,
+                )
+
+
 def show_upload_page():
     st.header("데이터 업로드")
     tab1, tab2, tab3 = st.tabs(["매출", "재고", "재무제표"])
@@ -500,5 +919,4 @@ def show_upload_page():
         _show_inventory_upload()
 
     with tab3:
-        st.subheader("재무제표 업로드 (.xlsx)")
-        st.info("재무제표 업로드용 DB 테이블/포맷 확정이 필요합니다. 스키마를 알려주시면 연결하겠습니다.")
+        _show_financial_upload()
