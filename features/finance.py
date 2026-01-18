@@ -802,25 +802,34 @@ def show_finance_page():
                 else:
                     updates = []
                     update_params = []
-                if new_account.strip():
-                    updates.append("account_name=%s")
-                    update_params.append(new_account.strip())
-                if new_amount.strip():
-                    updates.append("amount=%s")
-                    update_params.append(float(new_amount.replace(",", "")))
-                if new_period.strip():
-                    updates.append("period=%s")
-                    update_params.append(new_period.strip())
+                    if new_account.strip():
+                        updates.append("account_name=%s")
+                        update_params.append(new_account.strip())
+                    if new_amount.strip():
+                        try:
+                            amt = float(new_amount.replace(",", ""))
+                        except Exception:
+                            st.warning("금액 형식이 올바르지 않습니다.")
+                            amt = None
+                        if amt is not None:
+                            updates.append("amount=%s")
+                            update_params.append(amt)
+                    if new_period.strip():
+                        updates.append("period=%s")
+                        update_params.append(new_period.strip())
                     if not updates:
                         st.warning("수정할 값을 입력해주세요.")
                     else:
                         update_params.append(int(edit_id))
-                        exec_sql(
+                        affected = exec_sql(
                             f"UPDATE financial_statement SET {', '.join(updates)} WHERE id=%s",
                             tuple(update_params),
                         )
-                        st.success("수정 완료")
-                        st.rerun()
+                        if affected <= 0:
+                            st.warning("수정할 데이터를 찾지 못했습니다. ID를 확인해주세요.")
+                        else:
+                            st.success("수정 완료")
+                            st.rerun()
             if c2.button("세부계정 삭제"):
                 if edit_id <= 0:
                     st.warning("ID를 입력해주세요.")
