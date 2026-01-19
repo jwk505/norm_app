@@ -244,6 +244,8 @@ def _compute_kpis(detail_df: pd.DataFrame, periods: list[str]) -> None:
 
         return {
             "매출액": sales,
+            "판관비": sga,
+            "인건비": labor,
             "매출이익률(%)": gross_margin * 100,
             "영업이익률(%)": op_margin * 100,
             "당기순이익률(%)": net_margin * 100,
@@ -280,14 +282,18 @@ def _compute_kpis(detail_df: pd.DataFrame, periods: list[str]) -> None:
 
         display_cols = ["기간"] + num_cols
         comp_df = comp_df[display_cols]
-        amount_cols = [c for c in num_cols if c in ["매출액"]]
+        amount_cols = [c for c in num_cols if c in ["매출액", "판관비", "인건비"]]
         other_num_cols = [c for c in num_cols if c not in amount_cols]
         format_map = {c: "{:,.1f}" for c in other_num_cols}
         render_table(comp_df, number_cols=amount_cols, number_cols_format=format_map)
 
         st.subheader("기간 비교 그래프")
         metric_options = [c for c in num_cols]
-        default_metrics = [c for c in ["매출액", "영업이익률(%)", "당기순이익률(%)"] if c in metric_options]
+        default_metrics = [
+            c
+            for c in ["매출액", "판관비", "인건비", "판관비율(%)", "영업이익률(%)", "당기순이익률(%)"]
+            if c in metric_options
+        ]
         sel_metrics = st.multiselect("그래프 지표 선택", metric_options, default=default_metrics)
         if sel_metrics:
             chart_df = comp_df[["기간"] + sel_metrics].copy()
@@ -357,6 +363,24 @@ def _compute_kpis(detail_df: pd.DataFrame, periods: list[str]) -> None:
     op_margin = (op_profit / sales) if sales else 0.0
     net_margin = (net_profit / sales) if sales else 0.0
 
+    with st.expander("인건비 집계 상세", expanded=False):
+        labor_mask = (df["statement_type"].astype(str).str.upper() == "IS") & (
+            (df["account_name"].astype(str) == "인건비")
+            | df["account_name"].astype(str).str.contains("급여|인건비|급료", case=False, na=False)
+        )
+        labor_rows = df.loc[labor_mask].copy()
+        if labor_rows.empty:
+            st.info("인건비로 집계된 계정이 없습니다.")
+        else:
+            labor_rows["amount"] = pd.to_numeric(labor_rows["amount"], errors="coerce").fillna(0)
+            labor_rows["account_name"] = labor_rows["account_name"].astype(str)
+            detail = (
+                labor_rows.groupby(["account_name"], as_index=False)["amount"]
+                .sum()
+                .sort_values("amount", ascending=False)
+            )
+            detail = detail.rename(columns={"account_name": "계정", "amount": "금액"})
+            render_table(detail, number_cols=["금액"])
     st.subheader("경영 지표", help=(
         "계산식 요약\n"
         "- 재고회전율 = 매출원가 / 평균재고\n"
