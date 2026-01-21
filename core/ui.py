@@ -47,6 +47,18 @@ def render_table(
     for c, f in number_cols_format.items():
         if c in view.columns:
             fmt[c] = f
+    max_cells = pd.get_option("styler.render.max_elements")
+    total_cells = int(view.shape[0]) * int(view.shape[1])
+    use_styler = total_cells <= max_cells
+
+    if not use_styler:
+        display_df = view.copy()
+        for c, f in fmt.items():
+            if c in display_df.columns:
+                display_df[c] = display_df[c].map(lambda x: f.format(x) if pd.notna(x) else "")
+        st.dataframe(display_df, use_container_width=True, hide_index=hide_index, key=key)
+        return
+
     sty = view.style.format(fmt, na_rep="")
 
     if total_label and len(view.columns) > 0:
